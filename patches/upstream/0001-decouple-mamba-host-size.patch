@@ -1,0 +1,34 @@
+# Decouple the Mamba host tier from the KV hicache ratio.
+# Stock scales the mamba host pool only proportionally to --hicache-ratio (_split_hicache_size,
+# hybrid_pool_assembler.py:114-127), so a 4 GB mamba host pool drags ~35 GB of pinned KV host RAM.
+# This hook (env SGLANG_MAMBA_HOST_SIZE_GB, plus a forward-compatible getattr for a future
+# --mamba-host-size flag) sizes the mamba host tier independently: same host_hit=6784 at ~25 GB
+# pinned RAM instead of ~42 GB (4-arm test, docs/mamba-offload/14-p3-root-cause.md). NOT anchor-gated;
+# default OFF (env unset => byte-identical to stock). server_args.py is SHA-pinned by the
+# sglang-ssd-stream plugin, hence the env var instead of a new flag.
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+index bedf086a6..bdd9da713 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++import os
++
+ import logging
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Callable, Optional
+@@ -698,6 +700,13 @@ def build_hybrid_mamba_stack(
+         kv_host_size, mamba_host_size = _split_hicache_size(
+             server_args.hicache_size, (kv_pool, mamba_pool)
+         )
++    # P3-3: decouple the Mamba host tier from the KV ratio (flag, or env for A/B).
++    _mh = int(getattr(server_args, "mamba_host_size", 0) or 0)
++    _env_mh = float(os.environ.get("SGLANG_MAMBA_HOST_SIZE_GB", "0") or 0)
++    if _env_mh > 0:
++        _mh = _env_mh
++    if _mh > 0:
++        mamba_host_size = _mh
+     kv_host_pool = build_kv_host_pool(
+         kv_pool=kv_pool,
+         page_size=params.page_size,

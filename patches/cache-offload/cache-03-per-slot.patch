@@ -1,0 +1,519 @@
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+index e39a9e01c..fc3dec269 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -803,7 +820,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         until_node = self.node_by_id(until_node_id)
+         prefix_chunks: list[torch.Tensor] = []
+         node = self.node_by_id(from_node_id)
++        _per_slot = os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1"
+         while node is not until_node:
++            if _per_slot and node is None:
++                # per-slot: load_back may recycle/detach until_node so the parent walk
++                # reaches None. Return EMPTY (never partial chunks -> no prefix dup).
++                return self._empty_match_result.device_indices
+             value = node.component_data[BASE_COMPONENT_TYPE].value
+             assert value is not None
+             prefix_chunks.append(value)
+@@ -1228,7 +1250,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         result = EvictDeviceLeafResult()
+         node = self.node_by_id(node_id)
+         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+-        if not node.backuped:
++        # P1: host-anchored (Mamba-only) nodes are demoted, not deleted.
++        # CRASH-FIX (per-slot, gated): a Mamba host anchor must NEVER outlive FULL
++        # across both tiers. When this D-leaf's only host anchor is a Mamba row (no
++        # FULL host), demoting frees FULL device and leaves a DEAD node with an
++        # orphaned Mamba host anchor -> sanity_check R2/R3 (the cand-p18 crash-loop).
++        # Delete it instead: _delete_unbacked_device_leaf frees FULL device AND the
++        # Mamba host slot (target=ALL) and removes the node. At flag=0 host_anchored()
++        # is already False, so the else branch is byte-identical to the pre-fix line.
++        if os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1":
++            _anchor_keeps_alive = node.backuped
++        else:
++            _anchor_keeps_alive = node.backuped or host_anchored(node)
++        if not _anchor_keeps_alive:
+             if is_write_back:
+                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+                 return result
+@@ -1633,7 +1683,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+                 break
+ 
+             has_device = cur.component_data[ct].value is not None
+-            has_host = cur.component_data[ct].host_value is not None
++            # P1: any host anchor (FULL, or Mamba-only when enabled) keeps the
++            # node as an H-leaf instead of cascading its deletion upward.
++            # CRASH-FIX (per-slot, gated): a Mamba-only host anchor (no FULL host)
++            # must NOT keep a FULL-dead ancestor alive -- that is a dead node with an
++            # orphaned anchor (sanity_check R2/R3). Requiring FULL host here lets the
++            # existing cascade (below) free the Mamba host slot and delete the node.
++            # At flag=0 the else branch is byte-identical to the pre-fix expression.
++            if os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1":
++                has_host = cur.component_data[ct].host_value is not None
++            else:
++                has_host = (
++                    cur.component_data[ct].host_value is not None
++                    or host_anchored(cur)
++                )
+ 
+             if has_device:
+                 self._update_evictable_leaf_sets(cur)
+@@ -2092,6 +2156,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         expected_hst_leaves: set[UnifiedTreeNode] = set()
+         expected_duplicates: set[UnifiedTreeNode] = set()
+ 
++        _per_slot = os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1"  # EDIT1 (R2 relax), inert at flag=0
+         for node in all_nodes:
+             if node is self.root_node:
+                 continue
+@@ -2109,7 +2174,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+                 if cd.host_value is not None and not full_hst:
+                     # write_back reclaim takes only the Full host layer; an
+                     # aux host slice may outlive it while Full device is live.
+-                    if not (self.is_write_back and full_dev):
++                    if not ((self.is_write_back or (_per_slot and ct is ComponentType.MAMBA)) and full_dev):
+                         E(f"node {nid} {ct} host present but Full.host_value=None")
+ 
+             # Every node must keep Full data on at least one layer.
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+index fe5347ac3..3b74b5445 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -3,8 +3,13 @@ from __future__ import annotations
+ from collections import defaultdict
+ from typing import TYPE_CHECKING, Callable, Optional, Sequence
+ 
++import logging
++import os
++
+ import torch
+ 
++logger = logging.getLogger(__name__)
++
+ from sglang.srt.mem_cache.base_prefix_cache import (
+     DecLockRefParams,
+     EvictParams,
+@@ -20,6 +25,12 @@ from sglang.srt.mem_cache.hicache_storage import (
+     PoolTransfer,
+     PoolTransferResult,
+ )
++from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
++from sglang.srt.mem_cache.unified_cache.component_type import (
++    mamba_host_anchor_enabled,
++    mamba_host_debug_enabled,
++    mamba_spill_low_water,
++)
+ from sglang.srt.mem_cache.unified_cache.cache_action import (
+     FreeComponentDeviceSlot,
+     FreeComponentHostSlot,
+@@ -208,6 +219,8 @@ class MambaComponent(TreeComponent):
+                 self.cache.dec_lock_ref(
+                     result.best_match_node, lock_result.to_dec_params()
+                 )
++                if dst_index is None:
++                    dst_index = self.spill_and_alloc_one()
+                 assert dst_index is not None, "Can not alloc mamba cache"
+             req.mamba_pool_idx = dst_index[0]
+         req.mamba_cow_src_index = src_index
+@@ -230,6 +243,7 @@ class MambaComponent(TreeComponent):
+                 params.mamba_value
+             )
+             self._emit_excess_path_states_eviction(node, cache_actions)
++            self._maybe_proactive_spill()
+             return
+         if node.component_data[self.component_type].value is None:
+             node.component_data[self.component_type].value = params.mamba_value
+@@ -243,6 +257,7 @@ class MambaComponent(TreeComponent):
+             )
+             node.last_access_time = get_and_increase_time_counter()
+             self._emit_excess_path_states_eviction(node, cache_actions)
++            self._maybe_proactive_spill()
+             return
+         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
+         node.last_access_time = get_and_increase_time_counter()
+@@ -483,15 +498,355 @@ class MambaComponent(TreeComponent):
+                 self.tree_core.component_protected_size_[ct] -= vlen
+             cd.lock_ref -= 1
+ 
++    def _mamba_host_pool(self):
++        cc = getattr(self.cache, "cache_controller", None)
++        if cc is None:
++            return None
++        entry = getattr(cc, "mem_pool_host", None)
++        entry_map = getattr(entry, "entry_map", None)
++        if entry_map is None:
++            return None
++        ent = entry_map.get(PoolName.MAMBA)
++        return getattr(ent, "host_pool", None) if ent is not None else None
++
++    def _host_pool_usage(self) -> tuple[int, int]:
++        """HOST mamba pool (used, total). The [MAMBA-HOST] line historically only
++        printed the *device* allocator's available (a red herring for host-full
++        bails); this exposes the host pool's own occupancy so production can see
++        the real 'host-alloc-full' pressure. Returns (-1, -1) when absent."""
++        hp = self._mamba_host_pool()
++        if hp is None:
++            return -1, -1
++        total = int(getattr(hp, "size", -1))
++        try:
++            avail = int(hp.available_size())
++        except Exception:
++            avail = -1
++        return (total - avail if total >= 0 and avail >= 0 else -1), total
++
++    def _reclaim_host_anchor_slots(self, host_pool) -> int:
++        """PHASE-1 RETENTION FIX (per-slot only, called only when host alloc just
++        returned None). Free host mamba slots that can no longer be restored so
++        host_pool.alloc() stops returning None.
++
++        We reuse the sanctioned host-eviction path (cache.evict_host -> the tree
++        core's drive_host_eviction walk over the mamba HOST LRU) rather than
++        free()ing raw slots, so LRU membership / host-leaf sets / tombstone
++        cascade stay consistent (no double-membership, no leak). That walk frees
++        BOTH required cases in LRU order:
++          * the least-recently-used host anchor (internal node -> mamba host
++            tombstone frees its host slot; H-leaf -> atomic host eviction); and
++          * an anchor whose FULL parent has been device-evicted -- such an anchor
++            is not load-backable (load-back needs the FULL path resident) and is
++            exactly the H-leaf / internal-tombstone victim the walk selects.
++        Bounded loop: stop as soon as a slot is reclaimed or the walk stops
++        making progress. Returns host slots reclaimed.
++        """
++        before = host_pool.available_size()
++        for _ in range(8):
++            freed = self.cache.evict_host(1, self.component_type)
++            if host_pool.available_size() > before:
++                break
++            if freed <= 0:
++                break  # walk found no eligible victim -> stop, do not spin
++        return host_pool.available_size() - before
++
++    _spill_diag_count: int = 0
++
++    def _spill_bail(self, reason: str, node_id, avail: int) -> None:
++        """Every bail path is logged (rate-capped) -- an unfalsifiable trigger is
++        worthless: silence could mean 'nothing eligible' or 'not wired'."""
++        self._spill_bail_counts = getattr(self, "_spill_bail_counts", {})
++        n = self._spill_bail_counts.get(reason, 0) + 1
++        self._spill_bail_counts[reason] = n
++        if n <= 3 or n % 64 == 0:
++            if os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1":
++                # HOST pool occupancy on the bail line: 'available' is the DEVICE
++                # allocator (a red herring for host-full bails); host_used/total is
++                # the HOST mamba pool's own occupancy -- the real signal for
++                # 'host-alloc-full'. Flag-gated so the flag=0 log is byte-identical.
++                host_used, host_total = self._host_pool_usage()
++                logger.info(
++                    "[MAMBA-HOST] spill-bail reason=%s node=%s available=%d "
++                    "host_used=%d host_total=%d n=%d",
++                    reason, node_id, avail, host_used, host_total, n,
++                )
++            else:
++                logger.info(
++                    "[MAMBA-HOST] spill-bail reason=%s node=%s available=%d n=%d",
++                    reason, node_id, avail, n,
++                )
++
++    def _pick_spill_victim(self):
++        """Oldest device-resident mamba checkpoint that is safe to demote.
++
++        Walks the mamba device LRU from the TAIL manually (the same lru_prev
++        chain get_prev_no_lock uses) instead of the leaf cursor: the just-inserted
++        node is insert_mru and most survivors are internal nodes absent from
++        evictable_device_leaves, so a leaf-only cursor finds nothing. Internal
++        nodes are legitimately spillable -- that is what a tombstone is.
++        Safety: never a node whose per-component lock_ref != 0 (a RUNNING
++        request holds it via acquire_component_lock), never host-locked, never
++        the root, never one with no device value or an existing host copy.
++        """
++        ct = self.component_type
++        lru = self.tree_core.lru_lists[ct]
++        pt = getattr(lru, "_pt", 0)
++        head = getattr(lru, "head", None)
++        skipped: list[str] = []
++        x = lru.tail.lru_prev[pt]
++        steps = 0
++        per_slot = os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1"
++        while x is not None and x is not head and steps < 64:
++            steps += 1
++            cd = x.component_data[ct]
++            if x is self.tree_core.root_node:
++                reason = "root"
++            elif cd.lock_ref != 0:
++                reason = "dev-locked"
++            elif cd.host_lock_ref != 0:
++                reason = "host-locked"
++            elif cd.value is None:
++                reason = "no-dev-value"
++            # PREFERRED VICTIM: if write_through already set cd.host_value,
++            # this is the ideal node to demote (device copy still exists).
++            elif per_slot and cd.host_value is not None:
++                reason = "per-slot-host-already"
++            elif per_slot and x.component_data[ComponentType.FULL].value is None:
++                reason = "per-slot-full-not-device"
++            elif per_slot and (
++                x.write_through_pending_id is not None
++                or x.load_back_pending_id is not None
++            ):
++                reason = "per-slot-dma-inflight"
++            elif not per_slot and not x.backuped:
++                reason = "not-backuped"
++            elif not per_slot and x not in self.tree_core.evictable_device_leaves:
++                reason = "not-d-leaf"
++            else:
++                if skipped and mamba_host_debug_enabled():
++                    self._dump_lru_diag(lru, pt, skipped, x.id)
++                return x
++            skipped.append(f"{x.id}:{reason}")
++            x = x.lru_prev[pt]
++        if mamba_host_debug_enabled():
++            self._dump_lru_diag(lru, pt, skipped, None)
++        return None
++
++    def _dump_lru_diag(self, lru, pt, skipped, chosen) -> None:
++        """One-shot observability: which nodes the tail walk rejected, and what
++        the LRU actually holds. Capped so it cannot spam the scheduler log."""
++        if self._spill_diag_count >= 3:
++            return
++        self._spill_diag_count += 1
++        ids = list(lru.cache.keys())
++        flags = []
++        for nid in ids[:5] + ids[-5:]:
++            cd = self.tree_core.node_by_id(nid).component_data[self.component_type]
++            flags.append(
++                f"{nid}(v={cd.value is not None},h={cd.host_value is not None},"
++                f"lk={cd.lock_ref},hlk={cd.host_lock_ref})"
++            )
++        logger.info(
++            "[MAMBA-HOST] victim-walk len=%d chosen=%s rejected=%s lru=%s",
++            len(ids), chosen, skipped[:8], " ".join(flags),
++        )
++
++    def spill_to_host(self) -> bool:
++        """P3-1 PRODUCER: D->H copy of one mamba checkpoint, then free the VRAM
++        slot while keeping the radix node alive as a MAMBA-only host anchor.
++        Returns False when the flag is off, the host tier is absent, or no
++        victim/host slot is available -- callers then fall back to today's
++        evict-or-assert behaviour, so the default path is untouched."""
++        if not mamba_host_anchor_enabled():
++            return False
++        avail = self.cache.req_to_token_pool.mamba_allocator.available_size()
++        cc = getattr(self.cache, "cache_controller", None)
++        if cc is None or not hasattr(cc, "write"):
++            self._spill_bail("no-controller", None, avail)
++            return False
++        node = self._pick_spill_victim()
++        if node is None:
++            self._spill_bail("no-victim", None, avail)
++            return False
++        cd = node.component_data[self.component_type]
++        # PREFERRED VICTIM: if write_through already put the Mamba row on
++        # host, skip host alloc + D->H copy and go straight to the gate/demote.
++        copied_host_slot = False
++        dst = None
++        if cd.host_value is None:
++            host_pool = self._mamba_host_pool()
++            if host_pool is None:
++                self._spill_bail("no-host-pool", node.id, avail)
++                return False
++            dst = host_pool.alloc(1)
++            if dst is None and os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1":
++                # PHASE-1 RETENTION FIX: resident write_through host anchors are
++                # never reclaimed on the per-slot path (it skips the whole-node
++                # demote that would drive host eviction), so host_pool.alloc(1)
++                # returns None after ~6 spills -> 'host-alloc-full' stalls the
++                # ladder. Reclaim LRU host anchors, including anchors whose FULL
++                # parent has been device-evicted (dead: never load-backable), so
++                # the host pool can accept the next spill. Flag-gated: inert at 0.
++                self._reclaim_host_anchor_slots(host_pool)
++                dst = host_pool.alloc(1)
++            if dst is None:
++                self._spill_bail("host-alloc-full", node.id, avail)
++                return False
++            # D7 FIX: a spill is NOT a write-through backup, so it must not enter
++            # ongoing_write_through (that is what made _finish_write_through_ack pop a
++            # key that was never registered -> KeyError 28, unified_radix_cache.py:1251).
++            # Copy directly through the L2 engine: it owns a dedicated device->host
++            # stream, records start/finish events and record_stream()s the operands.
++            eng = getattr(cc, "l2_transfer_engine", None)
++            dev_pool = getattr(self.cache.req_to_token_pool, "mamba_pool", None)
++            if eng is None or dev_pool is None:
++                host_pool.free(dst)
++                self._spill_bail("no-l2-engine", node.id, avail)
++                return False
++            try:
++                from sglang.srt.mem_cache.l2_transfer import L2Transfer
++
++                done = eng.submit_device_to_host(
++                    [L2Transfer(host_pool, dev_pool, dst, cd.value.clone())]
++                )
++                # Order the compute stream after the copy (event wait, never a CPU
++                # sync), so nothing can write new state into the slot we are about to
++                # free until the D->H copy has landed.
++                torch.cuda.current_stream().wait_event(done.finish_event)
++            except Exception as exc:  # never corrupt: bail loudly, keep the slot
++                host_pool.free(dst)
++                self._spill_bail(f"l2-copy-failed:{type(exc).__name__}", node.id, avail)
++                return False
++            cd.host_value = dst.clone()
++            copied_host_slot = True
++        if os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1":
++            # PER-SLOT tail (EDIT 3): free ONLY the mamba device row; FULL stays on
++            # device. _evict_component_and_detach_lru(DEVICE) detaches the device LRU
++            # (no BOTH-LRU crash), tombstones cd.value, inserts the mamba host LRU.
++            # We SKIP tree_core.demote (which frees FULL) and the whole-node parent_host_ok gate.
++            self.mamba_spill_count += 1
++            if mamba_host_debug_enabled():
++                logger.info(
++                    "[MAMBA-HOST] per-slot spill node=%s mamba_slot=%s -> host=%s total=%d",
++                    node.id, cd.value.tolist(), cd.host_value.tolist(),
++                    self.mamba_spill_count,
++                )
++            _df = defaultdict(list)
++            _hf = defaultdict(list)
++            _tr = {c: 0 for c in self.cache.tree_components}
++            self.tree_core._evict_component_and_detach_lru(
++                node, self, _df, _hf, target=EvictLayer.DEVICE, tracker=_tr
++            )
++            self.cache._free_values(_df, _hf)
++            return True
++        # COMPLETE whole-node gate. If a copy was needed, it has landed;
++        # now require a sanctioned whole-node demote candidate before the FULL
++        # trigger demote. This forbids mamba-host-only survivors and preserves
++        # parent/host ordering (R5).
++        parent = node.parent
++        parent_host_ok = (
++            self.tree_core.is_write_back
++            or parent is None
++            or parent is self.tree_core.root_node
++            or parent.component_data[ComponentType.FULL].host_value is not None
++        )
++        if not node.backuped:
++            gate_reason = "post-copy-not-backuped"
++        elif cd.host_value is None:
++            gate_reason = "post-copy-no-mamba-host"
++        elif node not in self.tree_core.evictable_device_leaves:
++            gate_reason = "post-copy-not-d-leaf"
++        elif not parent_host_ok:
++            gate_reason = "post-copy-parent-not-host"
++        else:
++            gate_reason = None
++        if gate_reason is not None:
++            if copied_host_slot:
++                cd.host_value = None
++                host_pool.free(dst)
++            self._spill_bail(gate_reason, node.id, avail)
++            return False
++        self.mamba_spill_count += 1
++        if mamba_host_debug_enabled():
++            logger.info(
++                "[MAMBA-HOST] spill node=%s slot=%s -> host=%s total=%d",
++                node.id, cd.value.tolist(),
++                (dst if dst is not None else cd.host_value).tolist(),
++                self.mamba_spill_count,
++            )
++        # : WHOLE-NODE demote (FULL trigger) only. demote() detaches the
++        # device LRU, decrements evictable[FULL] by the span, returns FULL pages
++        # to the allocator, and inserts FULL+MAMBA into host LRU as a unit.
++        res = self.tree_core.demote(node.id)
++        self.cache._free_values(res.device_frees, res.host_frees)
++        return True
++
++    def spill_and_alloc_one(self):
++        """Spill-then-retry for the three alloc-or-assert sites."""
++        for _ in range(2):
++            if not self.spill_to_host():
++                return None
++            slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
++            if slot is not None:
++                return slot
++        return None
++
++    mamba_proactive_spill_count: int = 0
++
++    def _maybe_proactive_spill(self) -> None:
++        """P3-1 follow-up: spill on a high-water mark at checkpoint-insert time.
++
++        The reactive hook (spill_and_alloc_one) is dead code on a box where
++        tree.evict() can always free one slot -- allocation never fails, so the
++        oldest checkpoint is simply destroyed instead of demoted. Triggering on
++        a low-water mark right after a checkpoint is inserted is what actually
++        converts host DRAM into checkpoint capacity at equal VRAM.
++
++        Safety: _pick_spill_victim() skips the root, anything with no device
++        value, anything already on host, and anything with node.lock_ref or
++        component lock_ref != 0 (i.e. live requests / outstanding refs), and
++        requires the node to be an evictable device leaf. Bounded loop so a
++        pathological tree cannot stall the scheduler.
++        """
++        if not mamba_host_anchor_enabled():
++            return
++        low_water = mamba_spill_low_water()
++        if low_water <= 0:
++            return
++        alloc = self.cache.req_to_token_pool.mamba_allocator
++        avail = alloc.available_size()
++        if avail >= low_water:
++            return
++        before = avail
++        n = 0
++        while avail < low_water and n < 8:
++            if not self.spill_to_host():
++                break
++            n += 1
++            avail = alloc.available_size()
++        if n:
++            self.mamba_proactive_spill_count += n
++            if mamba_host_debug_enabled():
++                logger.info(
++                    "[MAMBA-HOST] proactive spill=%d available %d->%d low_water=%d "
++                    "total=%d",
++                    n, before, avail, low_water, self.mamba_proactive_spill_count,
++                )
++
+     def _alloc_mamba_slot(self) -> torch.Tensor:
+         """Allocate one mamba pool slot, evicting if necessary."""
+         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+         if slot is None:
+             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
++            if slot is None:
++                slot = self.spill_and_alloc_one()
+             assert slot is not None, "Can not alloc mamba cache"
+         return slot
+ 
++    mamba_spill_count: int = 0
++
+     @property
+     def int8_ckpt_pool(self):
+         return getattr(self.cache.req_to_token_pool, "mamba_ckpt_pool", None)
+@@ -662,6 +1017,8 @@ class MambaComponent(TreeComponent):
+         if dst is None:
+             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+             dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
++            if dst is None:
++                dst = self.spill_and_alloc_one()
+             assert dst is not None, "Cannot alloc mamba for load_back"
+         req.mamba_pool_idx = dst[0]
+         return PrepareLoadBackResult(allocated_mamba_slot=dst)
+@@ -800,6 +1157,20 @@ class MambaComponent(TreeComponent):
+                     host_lru.remove_node(node)
+                 self.tree_core.lru_lists[ct].insert_mru(node)
+                 self.tree_core.component_evictable_size_[ct] += count
++                if mamba_host_anchor_enabled():
++                    # P2-D5: order ALL later forward-stream work (including the
++                    # deferred COW that consumes req.mamba_pool_idx) after the
++                    # H->D copy. Earliest point the event exists; no CPU sync.
++                    cc = getattr(self.cache, "cache_controller", None)
++                    ev = getattr(cc, "mamba_pending_load_event", None) if cc else None
++                    if ev is not None:
++                        torch.cuda.current_stream().wait_event(ev)
++                        cc.mamba_pending_load_event = None
++                        self._d5_log = getattr(self, "_d5_log", 0) + 1
++                        if self._d5_log <= 3:
++                            logger.info(
++                                "[MAMBA-HOST] D5 wait_event joined n=%d", self._d5_log
++                            )
+ 
+         elif phase == CacheTransferPhase.PREFETCH:
+             if not transfers:

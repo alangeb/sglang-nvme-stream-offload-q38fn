@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: flash-next patches <patches@local>
+Subject: [PATCH 01/9] patch 1/9: python/sglang/srt/layers/quantization/gptq/gptq.py
+
+Extracted from sglang-flash-next:latest image (COPY'd over installed pkg).
+
+diff --git a/python/sglang/srt/layers/quantization/gptq/gptq.py b/python/sglang/srt/layers/quantization/gptq/gptq.py
+index 03f2f6c..bd4d175 100644
+--- a/python/sglang/srt/layers/quantization/gptq/gptq.py
++++ b/python/sglang/srt/layers/quantization/gptq/gptq.py
+@@ -48,6 +48,49 @@ def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
+     )
+ 
+ 
++def _merge_autoround_extra_config(
++    config: Dict[str, Any], dynamic: Dict[str, Any]
++) -> Dict[str, Any]:
++    """PATCH(qwen38-int8): translate AutoRound BF16 exclusions into dynamic rules.
++
++    AutoRound keeps selected modules in BF16 and lists them under
++    ``extra_config`` using UNFUSED HF module names (e.g.
++    ``model.language_model.layers.0.linear_attn.in_proj_a``). sglang builds
++    the GatedDeltaNet gate projections fused (``in_proj_ba`` = b + a), and
++    without a matching exclusion the fused module is created as a quantized
++    Marlin layer with mismatched dims and crashes at repack time
++    ("size_n = 96 is not divisible by tile_n_size = 64").
++
++    Convert every extra_config entry with bits==16 into a negative dynamic
++    rule ("-:<escaped-name>($|\\.)"), for both the HF spelling and the
++    sglang spelling of the prefix, plus the fused in_proj_ba variant.
++    """
++    import re as _re
++
++    extra_config = config.get("extra_config") or {}
++    for name, rule in extra_config.items():
++        if not isinstance(rule, dict) or rule.get("bits") != 16:
++            continue
++        candidates = {name}
++        if ".in_proj_a" in name:
++            candidates.add(name.replace(".in_proj_a", ".in_proj_ba"))
++        elif ".in_proj_b" in name:
++            candidates.add(name.replace(".in_proj_b", ".in_proj_ba"))
++        if name.startswith("model.language_model."):
++            stripped = name.replace("model.language_model.", "model.", 1)
++            candidates.add(stripped)
++            if ".in_proj_a" in stripped:
++                candidates.add(stripped.replace(".in_proj_a", ".in_proj_ba"))
++            elif ".in_proj_b" in stripped:
++                candidates.add(stripped.replace(".in_proj_b", ".in_proj_ba"))
++        for cand in candidates:
++            dynamic.setdefault("-:" + _re.escape(cand) + r"($|\.)", {"bits": 16})
++    logger.info(
++        "PATCH3(qwen38-int8): merged extra_config -> %d dynamic rules", len(dynamic)
++    )
++    return dynamic
++
++
+ class GPTQConfig(QuantizationConfig):
+     """Config class for GPTQ.
+ 
+@@ -146,6 +189,8 @@ class GPTQConfig(QuantizationConfig):
+     def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
+         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
+         dynamic = {} if dynamic is None else dynamic
++        # PATCH(qwen38-int8): honor AutoRound extra_config BF16 exclusions.
++        dynamic = _merge_autoround_extra_config(config, dynamic)
+ 
+         weight_bits = cls.get_from_keys(config, ["bits"])
+         group_size = cls.get_from_keys(config, ["group_size"])
+@@ -364,6 +409,8 @@ class GPTQMarlinConfig(QuantizationConfig):
+     def from_config(cls, config: Dict[str, Any]) -> GPTQMarlinConfig:
+         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
+         dynamic = {} if dynamic is None else dynamic
++        # PATCH(qwen38-int8): honor AutoRound extra_config BF16 exclusions.
++        dynamic = _merge_autoround_extra_config(config, dynamic)
+ 
+         weight_bits = cls.get_from_keys(config, ["bits"])
+         group_size = cls.get_from_keys(config, ["group_size"])
+@@ -415,9 +462,16 @@ class GPTQMarlinConfig(QuantizationConfig):
+ 
+         if isinstance(layer, FusedMoE):
+             return GPTQMarlinMoEMethod(self)
+-        return get_linear_quant_method(
++        result = get_linear_quant_method(
+             self, layer, prefix=prefix, linear_method_cls=GPTQMarlinLinearMethod
+         )
++        if prefix and ("linear_attn" in prefix or ".mtp" in prefix):
++            logger.debug(
++                "PATCH3(qwen38-int8): marlin get_quant_method %s -> %s",
++                prefix,
++                type(result).__name__ if result is not None else None,
++            )
++        return result
+ 
+     def get_linear_scheme(self, layer: torch.nn.Module):
+         return GPTQMarlinLinearScheme(self)

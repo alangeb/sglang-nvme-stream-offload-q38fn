@@ -1,0 +1,40 @@
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+index 3db4fa36e..d92d7c151 100644
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import threading
+ import time
+ from dataclasses import replace
+@@ -1293,6 +1294,27 @@ class UnifiedRadixCache(BasePrefixCache):
+                 ancestor_lock_params=ancestor_lock_params,
+                 host_anchor_params=host_anchor_params,
+             )
++            if success and os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1":
++                # Per-pool load-back counter: attribute each host->device restore
++                # to the KV (FULL) pool vs the Mamba pool so production can tell
++                # which tier a restore came from. The Prometheus counter
++                # sglang:load_back_tokens_total{pool="kv"|"mamba"} already carries
++                # the per-pool token counts (HybridCacheController._num_tokens_by_pool);
++                # this adds a cumulative count + a rate-capped log so the restore
++                # attribution is visible without scraping. Flag-gated: inert at 0.
++                counts = getattr(self, "_loadback_pool_counts", None)
++                if counts is None:
++                    counts = self._loadback_pool_counts = {"kv": 0, "mamba": 0, "n": 0}
++                counts["kv"] += 1
++                _mprep = preps.get(ComponentType.MAMBA)
++                if _mprep is not None and _mprep.allocated_mamba_slot is not None:
++                    counts["mamba"] += 1
++                counts["n"] += 1
++                if counts["n"] <= 3 or counts["n"] % 64 == 0:
++                    logger.info(
++                        "[MAMBA-HOST] load-back node=%s kv=%d mamba=%d n=%d",
++                        node_id, counts["kv"], counts["mamba"], counts["n"],
++                    )
+             return success
+         finally:
+             for comp in self._components_tuple:

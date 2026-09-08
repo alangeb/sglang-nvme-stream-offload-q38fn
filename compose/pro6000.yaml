@@ -1,0 +1,132 @@
+# Launch config for pro6000 (RTX PRO 6000, sm_120) — reference launch for Qwen3.8-Flash-Next.
+# GPU required at RUNTIME only; the image build is GPU-free.
+#
+# Derived from our production launch config (flag-for-flag), with:
+#   * model referenced by Hugging Face id (pull it yourself with your own token),
+#   * cache dirs relative to this compose file,
+#   * host-offload flags + env enabled (the feature this kit adds).
+#
+# Host-tier sizing: keep SGLANG_MAMBA_HOST_SIZE_GB + hicache host bytes comfortably
+# below available host RAM (the PLE SSD-stream page cache competes for the same RAM;
+# an oversized pinned tier can starve it and tank prefill throughput).
+services:
+  sglang-flash-next:
+    image: sglang-nvme-stream-offload-q38fn:latest
+    container_name: sglang-nvme-stream-offload-q38fn
+    ports:
+      - "8001:30000"
+    shm_size: 32gb
+    ipc: host
+    restart: 'no'
+    security_opt:
+      - seccomp=unconfined
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./cache/triton:/root/.triton
+      - ./cache/flashinfer:/root/.cache/flashinfer
+      - ./cache/sglang:/root/.cache/sglang
+      - ./cache/torch:/root/.cache/torch
+    environment:
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - CUDA_VISIBLE_DEVICES=0
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - SGLANG_QSA_USE_FP8_INDEXER=1
+      - SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0
+      # host offload (this kit's feature):
+      - SGLANG_MAMBA_HOST_SIZE_GB=16
+      - SGLANG_MAMBA_HOST_ANCHOR=1
+      - SGLANG_MAMBA_PER_SLOT=0   # per-slot mode (cache-03) is opt-in experimental
+    command:
+      - sglang
+      - serve
+      - --model
+      - garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream
+      - --served-model-name
+      - model
+      - --host
+      - 0.0.0.0
+      - --port
+      - '30000'
+      - --trust-remote-code
+      - --tensor-parallel-size
+      - '1'
+      - --max-running-requests
+      - '4'
+      - --cuda-graph-max-bs-decode
+      - '4'
+      - --chunked-prefill-size
+      - '4096'
+      - --mem-fraction-static
+      - '0.985'
+      - --max-total-tokens
+      - '800000'
+      - --quantization
+      - modelopt_fp4
+      - --moe-runner-backend
+      - flashinfer_cutlass
+      - --fp4-gemm-backend
+      - flashinfer_cutlass
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --page-size
+      - '64'
+      - --mamba-radix-cache-strategy
+      - extra_buffer_lazy
+      - --mamba-track-interval
+      - '64'
+      - --mamba-ssm-dtype
+      - bfloat16
+      - --speculative-algorithm
+      - NEXTN
+      # if the draft (MTP) weights live in an mtp/ subdir of the snapshot, point this at it
+      - --speculative-draft-model-path
+      - garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream
+      - --speculative-num-steps
+      - '3'
+      - --speculative-eagle-topk
+      - '1'
+      - --speculative-num-draft-tokens
+      - '4'
+      - --speculative-moe-runner-backend
+      - flashinfer_cutlass
+      - --speculative-draft-model-quantization
+      - fp8
+      - --ple-offload-embedding
+      - --schedule-policy
+      - lpm
+      - --allow-auto-truncate
+      - --mm-feature-transport=cpu
+      - --enable-cache-report
+      - --enable-metrics
+      - --uvicorn-access-log-exclude-prefixes
+      - /health
+      - /metrics
+      - /v1/chat/completions
+      - --sleep-on-idle
+      - --max-mamba-cache-size
+      - '16'
+      - --sampling-backend
+      - flashinfer
+      - --attention-backend
+      - flashinfer
+      - --linear-attn-decode-backend
+      - flashinfer
+      - --mm-attention-backend
+      - flashinfer_cudnn
+      - --tool-call-parser
+      - auto
+      - --reasoning-parser
+      - auto
+      # host offload (this kit's feature):
+      - --enable-hierarchical-cache
+      - --hicache-write-policy
+      - write_through
+      - --hicache-ratio
+      - '2.0'

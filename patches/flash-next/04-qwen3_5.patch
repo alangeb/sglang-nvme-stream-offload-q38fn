@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: flash-next patches <patches@local>
+Subject: [PATCH 04/9] patch 4/9: python/sglang/srt/models/qwen3_5.py
+
+Extracted from sglang-flash-next:latest image (COPY'd over installed pkg).
+
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 1f447f2..384ae78 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1872,6 +1872,49 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+     def should_apply_lora(self, module_name: str) -> bool:
+         return module_name.startswith("model.layers.")
+ 
++    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
++        # PATCH(qwen38-fp8): wire compressed-tensors calibrated FP8-KV scales.
++        # The checkpoint ships per-layer k_scale/v_scale for full-attention
++        # layers, but this build has no compressed-tensors KV path, so those
++        # tensors are skipped at shard-load time and the cache runs at unit
++        # scale. Load them here from a JSON of the shape
++        #   {"<layer_idx>": {"k": float, "v": float}, ...}
++        # and set both forms consistently:
++        #   .k_scale/.v_scale (tensor)  -> quantizes KV on write
++        #   .k_scale_float/.v_scale_float (host float) -> descale in attention
++        import json as _json
++        import re as _re
++
++        with open(quantization_param_path, "r", encoding="utf-8") as _f:
++            layer_scales = _json.load(_f)
++        if not layer_scales:
++            return
++
++        device = next(self.parameters()).device
++        pattern = _re.compile(r"layers\.(\d+)\.attn$")
++        applied = 0
++        for name, module in self.named_modules():
++            match = pattern.search(name)
++            if match is None or not hasattr(module, "k_scale"):
++                continue
++            entry = layer_scales.get(match.group(1))
++            if not entry:
++                continue
++            module.k_scale = torch.tensor(
++                float(entry["k"]), dtype=torch.float32, device=device
++            )
++            module.v_scale = torch.tensor(
++                float(entry["v"]), dtype=torch.float32, device=device
++            )
++            module.k_scale_float = float(entry["k"])
++            module.v_scale_float = float(entry["v"])
++            applied += 1
++        logger.info(
++            "PATCH(qwen38-fp8): applied calibrated FP8-KV scales from %s to %d attention layers",
++            quantization_param_path,
++            applied,
++        )
++
+     @property
+     def start_layer(self) -> int:
+         return getattr(getattr(self, "model", None), "start_layer", 0)
+@@ -1998,6 +2041,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                     )
+                     weight_loader(param_lm_head, loaded_weight)
+             loaded_params.add(name)
++        # PATCH(qwen38-fp8): apply calibrated FP8-KV scales after weight load.
++        # Triggered via env var instead of --quantization-param-path so that
++        # speculative workers (DFlash2 draft model) are unaffected.
++        import os as _os
++
++        _scales_path = _os.environ.get("SGLANG_KV_SCALES_JSON")
++        if _scales_path:
++            self.load_kv_cache_scales(_scales_path)
+         return loaded_params
+ 
+ 

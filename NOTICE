@@ -1,0 +1,41 @@
+NOTICE
+======
+
+SGLang NVMe-Stream + Host-Offload Build Kit
+Copyright (c) 2026 Build Kit Contributors
+
+We did not build most of this. This product includes software developed by others:
+
+1. SGLang Project (https://github.com/sgl-project/sglang) — Apache-2.0.
+   The engine this kit builds on. Base commit 3df8e1e7dbc5807696622afe2929b6c33c185ca3
+   = HEAD of OPEN, UNMERGED PR #36644 ('[Qwen3.8] Fix FP8 KV cache support in QSA'),
+   base branch qwen4-main-squashed, authored by LingZ315. We build on their unmerged
+   work; this pin is fragile (may be force-pushed/closed) and is not in public main.
+
+2. sglang-ssd-stream — Rust/pyo3 io_uring NVMe streaming reader (PLE plugin).
+   Author/project: Garner McCloud — https://github.com/garnermccloud/sglang-ssd-stream
+   (NOTICE in vendor/sglang-ssd-stream: 'Copyright 2026 Garner McCloud').
+   THIRD-PARTY — NOT authored by us. We merely vendor + build it under
+   vendor/sglang-ssd-stream/. Licensed under Apache-2.0.
+
+3. Qwen model family — Alibaba Qwen team (https://github.com/QwenLM).
+   Reference model: Qwen3.8-Flash-Next-NVFP4-SSD-Stream, a THIRD-PARTY, UNOFFICIAL
+   quantization by garnermccloud (HuggingFace). We do NOT distribute weights.
+   Pull separately: garnermccloud/Qwen3.8-Flash-Next-NVFP4-SSD-Stream
+   @ 7b719225242aacd3dbd3f9407468c2ee9a9d2594
+
+4. FlashInfer (https://github.com/flashinfer-ai/flashinfer) — used via
+   flashinfer-python / flashinfer-cubin / flashinfer-jit-cache in the Dockerfile.
+
+5. NVIDIA CUDA / cuDNN / TensorRT — Proprietary. Subject to NVIDIA EULA.
+
+6. FlashAttention CUTE kernel (BSD-3-Clause) — vendored under
+   vendor/sglang-baseline/python/sglang/kernels/ops/attention/flash_attn/cute/.
+   'Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file'
+   (BSD-3-Clause: redistribution must retain this notice — it travels with the
+   vendored LICENSE file). The CUTE DSL it targets is NVIDIA CUTLASS CuTe.
+7. Triton (MIT) and PyTorch (BSD-3/Apache-2.0) — pulled at build time via the base
+   image / pip (not vendored here); listed for completeness.
+
+Our patches (flash-next 01-09, cache-offload 01-05, upstream sizing) are derivative
+works of sglang and inherit the Apache-2.0 attribution obligation.

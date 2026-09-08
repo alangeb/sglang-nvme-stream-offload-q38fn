@@ -1,0 +1,304 @@
+diff --git a/python/sglang/srt/mem_cache/unified_cache/component_type.py b/python/sglang/srt/mem_cache/unified_cache/component_type.py
+index f09a63f0c..2b232b303 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/component_type.py
++++ b/python/sglang/srt/mem_cache/unified_cache/component_type.py
+@@ -1,6 +1,8 @@
+ """The per-attention component identity; a leaf module importable from anywhere."""
+ 
++import os
+ from enum import Enum
++from typing import Any, Optional
+ 
+ 
+ class ComponentType(int, Enum):
+@@ -28,3 +30,83 @@ class ComponentType(int, Enum):
+ 
+ 
+ BASE_COMPONENT_TYPE = ComponentType.FULL
++
++
++# ---------------------------------------------------------------------------
++# P1 (SGLANG_MAMBA_HOST_ANCHOR): widen the host-tier anchor to Mamba.
++#
++# The tree core decides host-tier survival from ComponentType.FULL only
++# (unified_tree_core.py:140-151 `backuped`/`evicted`, :1694-1708
++# `_is_host_leaf`, :1622-1636 tombstone walk). For a hybrid/mamba model the
++# Mamba state is a *whole-slot* copy that is worth more than the KV slice it
++# rides with, so losing it on a FULL-only test is what makes the host tier a
++# silent no-op (upstream issue #33713). `host_anchored()` is the single widened
++# test used by the few sites that gate survival. Default OFF: with the env flag
++# unset every call returns False and the code path is byte-identical to the
++# untouched tree, so A/B runs share one binary.
++# ---------------------------------------------------------------------------
++
++MAMBA_HOST_ANCHOR_ENV = "SGLANG_MAMBA_HOST_ANCHOR"
++_mamba_host_anchor_cache: Optional[bool] = None
++_mamba_host_debug_cache: Optional[bool] = None
++
++
++def mamba_host_anchor_enabled() -> bool:
++    """Cached read of SGLANG_MAMBA_HOST_ANCHOR (default off)."""
++    global _mamba_host_anchor_cache
++    if _mamba_host_anchor_cache is None:
++        _mamba_host_anchor_cache = (
++            os.environ.get(MAMBA_HOST_ANCHOR_ENV, "0").strip() == "1"
++        )
++    return _mamba_host_anchor_cache
++
++
++def mamba_host_debug_enabled() -> bool:
++    """Separate observability flag: logs the producer + the aux-only load-back.
++    Independent of SGLANG_MAMBA_HOST_ANCHOR so the control arm can be observed too."""
++    global _mamba_host_debug_cache
++    if _mamba_host_debug_cache is None:
++        _mamba_host_debug_cache = (
++            os.environ.get("SGLANG_MAMBA_HOST_DEBUG", "0").strip() == "1"
++        )
++    return _mamba_host_debug_cache
++
++
++_mamba_spill_low_water_cache: Optional[int] = None
++
++
++def mamba_spill_low_water() -> int:
++    """High-water trigger for the PROACTIVE mamba spill (P3-1 follow-up).
++
++    When the device mamba allocator drops below this many free slots, the
++    oldest safe checkpoint is D->H copied and its VRAM slot freed, instead of
++    waiting for an allocation to fail (which never happens: tree.evict() can
++    always free one slot by destroying the oldest checkpoint).
++    0 disables the proactive trigger. Only consulted when the anchor flag is
++    on, so the default path is untouched.
++    """
++    global _mamba_spill_low_water_cache
++    if _mamba_spill_low_water_cache is None:
++        try:
++            _mamba_spill_low_water_cache = max(
++                0, int(os.environ.get("SGLANG_MAMBA_SPILL_LOW_WATER", "4"))
++            )
++        except ValueError:
++            _mamba_spill_low_water_cache = 4
++    return _mamba_spill_low_water_cache
++
++
++def host_anchored(node: Any) -> bool:
++    """True if *node* may stay in the tree on host-tier evidence alone.
++
++    Satisfied by a FULL host copy (the upstream test) or, when the flag is on,
++    by a Mamba host copy. Used only where the current code *requires* FULL to
++    keep a node alive -- never to claim a node is fully restorable.
++    """
++    if not mamba_host_anchor_enabled():
++        return False
++    if node.component_data[ComponentType.FULL].host_value is not None:
++        return True
++    if ComponentType.MAMBA not in node.component_types:
++        return False
++    return node.component_data[ComponentType.MAMBA].host_value is not None
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+index 2c47e326d..cfacc444a 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+@@ -93,6 +93,11 @@ class PrefetchOperation(StorageOperation):
+         return self._terminated_flag
+ 
+ 
++from sglang.srt.mem_cache.unified_cache.component_type import (
++    mamba_host_anchor_enabled,
++)
++
++
+ class HybridCacheController(BaseHiCacheController):
+     def __init__(
+         self,
+@@ -545,6 +550,22 @@ class HybridCacheController(BaseHiCacheController):
+                 pool_transfers=pool_transfers or None,
+             )
+         )
++        if mamba_host_anchor_enabled():
++            # P2-D5: kick the H->D copy off now and publish its finish event so the
++            # forward stream can wait_event() on it instead of racing the copy
++            # (upstream PR #36743 class). Event wait, never a device synchronize.
++            try:
++                if self.start_loading() >= 0 and self.ack_load_queue:
++                    self.mamba_pending_load_event = self.ack_load_queue[
++                        -1
++                    ].finish_event
++                    self._d5_pub = getattr(self, "_d5_pub", 0) + 1
++                    if self._d5_pub <= 3:
++                        logger.info(
++                            "[MAMBA-HOST] D5 event published n=%d", self._d5_pub
++                        )
++            except Exception:  # never break the load path
++                logger.exception("[MAMBA-HOST] start_loading() in load() failed")
+         return device_indices
+ 
+     def prefetch(
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/full_component.py b/python/sglang/srt/mem_cache/unified_cache/components/full_component.py
+index 3ec838c38..d4798f954 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/full_component.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/full_component.py
+@@ -18,6 +18,11 @@ from sglang.srt.mem_cache.hicache_storage import (
+     PoolTransferResult,
+ )
+ from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceSlot
++from sglang.srt.mem_cache.unified_cache.component_type import (
++    host_anchored,
++    mamba_host_anchor_enabled,
++    mamba_host_debug_enabled,
++)
+ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+     CacheTransferPhase,
+     ComponentType,
+@@ -36,6 +41,11 @@ if TYPE_CHECKING:
+     )
+ 
+ 
++import logging
++
++logger = logging.getLogger(__name__)
++
++
+ class FullComponent(TreeComponent):
+     component_type = ComponentType.FULL
+ 
+@@ -246,6 +256,10 @@ class FullComponent(TreeComponent):
+             _, x = heapq.heappop(heap)
+             if x not in self.tree_core.evictable_host_leaves:
+                 continue
++            if mamba_host_anchor_enabled() and x.component_data[ct].host_value is None:
++                # P3-2: KV host pressure may only free KV host bytes; a node
++                # anchored on a Mamba host row alone has nothing for us to free.
++                continue
+             self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+             if (
+                 x.parent is not None
+@@ -367,7 +381,22 @@ class FullComponent(TreeComponent):
+             cur = node
+             while cur.evicted:
+                 cd = cur.component_data[ct]
+-                assert cd.host_value is not None
++                # P1: under SGLANG_MAMBA_HOST_ANCHOR a node may be anchored on a
++                # Mamba host copy alone; then the FULL walk stops here and the
++                # KV transfer is simply empty (aux transfers still load).
++                if cd.host_value is None:
++                    if host_anchored(cur):
++                        if mamba_host_debug_enabled():
++                            logger.info(
++                                "[MAMBA-HOST] aux-only load_back: FULL host copy gone "
++                                "at node=%s (kv_tokens truncated to %d)",
++                                cur.id, len(backed_up),
++                            )
++                        break
++                    raise AssertionError(
++                        "Full host value missing on evicted node "
++                        f"{cur.id} (not host-anchored)"
++                    )
+                 backed_up.append(cd.host_value)
+                 nodes.append(cur)
+                 cur = cur.parent
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+index e39a9e01c..fc3dec269 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -16,6 +16,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
+ 
+ from __future__ import annotations
+ 
++import os
+ import logging
+ import sys
+ from array import array
+@@ -49,6 +50,11 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
+     FreeDeviceKV,
+     ReplaceWriteThroughOnNodeSplit,
+ )
++from sglang.srt.mem_cache.unified_cache.component_type import (
++    host_anchored,
++    mamba_host_anchor_enabled,
++    mamba_host_debug_enabled,
++)
+ from sglang.srt.mem_cache.unified_cache.components import (
+     _NUM_COMPONENT_TYPES,
+     BASE_COMPONENT_TYPE,
+@@ -666,9 +672,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+             validators = tuple(
+                 comp.create_match_validator() for comp in self.components
+             )
++            # EDIT (per-slot tree fix, flag-gated): the device anchor indexes the FULL
++            # chunk list (UTC:720-721,769); gating it on MAMBA desyncs it from the
++            # FULL-only insert (UTC:938-1007) -> URC:828 prefix/new_indices mismatch.
++            # Under SGLANG_MAMBA_PER_SLOT, drop MAMBA's device validator so the anchor
++            # advances on FULL device chunks alone. Flag OFF -> filter always True
++            # (byte-identical to cand-p8). Mamba host-hit is handled separately
++            # (MC:187-192 -> init_load_back -> prepare_load_back -> MAMBA-only H->D).
++            _per_slot = os.environ.get("SGLANG_MAMBA_PER_SLOT", "0") == "1"
+             device_validators = tuple(
+                 comp.create_match_validator(match_device_only=True)
+                 for comp in self.components
++                if not (_per_slot and comp.component_type is ComponentType.MAMBA)
+             )
+         else:
+             validators = tuple(
+@@ -698,8 +713,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         while len(key) > 0 and child_key in node.children:
+             child = node.children[child_key]
+ 
+-            # HiCache: dead node (evicted + not backuped) — stop traversal
+-            if child.evicted and not child.backuped:
++            # HiCache: dead node (evicted + not backuped) — stop traversal.
++            # P1: a Mamba host copy anchors the node too, so keep walking and let
++            # the Mamba validator credit the host hit (SGLANG_MAMBA_HOST_ANCHOR).
++            if child.evicted and not (child.backuped or host_anchored(child)):
+                 break
+ 
+             prefix_len = child.key.match(key, page_size=self.page_size)
+@@ -1422,6 +1456,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         """Free only the Full host layer; aux host slices stay under their own
+         pools' LRU (a host-only aux slice may be a sole copy)."""
+         assert self._can_reclaim_full_host_duplicate(node)
++        if mamba_host_debug_enabled():
++            aux_host = {
++                int(ct): node.component_data[ct].host_value is not None
++                for ct in node.component_types
++                if ct != int(BASE_COMPONENT_TYPE)
++            }
++            logger.info(
++                "[MAMBA-HOST] producer: released FULL host duplicate node=%s "
++                "aux_host_kept=%s anchor=%s",
++                node.id,
++                aux_host,
++                host_anchored(node),
++            )
+         self._record_remove_event(node, medium=StorageMedium.CPU)
+         self._evict_component_and_detach_lru(
+             node,
+@@ -1448,6 +1495,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
+ 
+         self._record_remove_event(node, medium=StorageMedium.CPU)
++        # : no retain_mamba. FULL host and MAMBA host are freed together on
++        # a host-leaf eviction, then the node is deleted; no mamba-host-only
++        # survivor is allowed.
+         for comp in self.components:
+             _, hf = self._evict_component_and_detach_lru(
+                 node,
+@@ -1481,7 +1531,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         device_frees: dict[ComponentType, list[torch.Tensor]],
+         host_frees: dict[ComponentType, list[torch.Tensor]],
+     ) -> None:
+-        assert not node.evicted and node.backuped
++        assert not node.evicted and (node.backuped or host_anchored(node))
+         trigger = self.components_by_type[BASE_COMPONENT_TYPE]
+         self._evict_component_and_detach_lru(
+             node,
+@@ -1699,7 +1762,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
+         marks need no check: marked nodes are never ``evicted``."""
+         if node is self.root_node or not node.evicted:
+             return False
+-        if not node.backuped:
++        # P1: Mamba host copy is a sufficient anchor on its own.
++        if not (node.backuped or host_anchored(node)):
+             return False
+         if any(cd.host_lock_ref > 0 for cd in node.component_data):
+             return False

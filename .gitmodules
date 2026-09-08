@@ -1,0 +1,4 @@
+[submodule "vendor/sglang-ssd-stream"]
+	path = vendor/sglang-ssd-stream
+	url = https://github.com/garnermccloud/sglang-ssd-stream.git
+	branch = v0.2.0

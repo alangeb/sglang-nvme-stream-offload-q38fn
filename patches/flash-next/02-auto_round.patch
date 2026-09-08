@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: flash-next patches <patches@local>
+Subject: [PATCH 02/9] patch 2/9: python/sglang/srt/layers/quantization/auto_round.py
+
+Extracted from sglang-flash-next:latest image (COPY'd over installed pkg).
+
+diff --git a/python/sglang/srt/layers/quantization/auto_round.py b/python/sglang/srt/layers/quantization/auto_round.py
+index 0924a00..2f262dd 100644
+--- a/python/sglang/srt/layers/quantization/auto_round.py
++++ b/python/sglang/srt/layers/quantization/auto_round.py
+@@ -152,7 +152,14 @@ class AutoRoundConfig(QuantizationConfig):
+             name for name, keys in gptq_config_keys.items() if not has_any_key(keys)
+         )
+ 
+-        return cls(
++        # PATCH(qwen38-int8): packed_modules_mapping is injected into the
++        # quant config dict by get_quant_config() (weight_utils.py) but was
++        # never read here, so get_layer_config()'s fused-module resolution
++        # (step 4) always saw an empty mapping. GatedDeltaNet checkpoints
++        # keep in_proj_b/in_proj_a in BF16 under unfused names while sglang
++        # builds the fused in_proj_ba module -> it fell through to the
++        # default INT8 path and crashed marlin repack (size_n=96 % 64 != 0).
++        quant_config = cls(
+             weight_bits=cls.get_from_keys(config, ["bits"]),
+             group_size=cls.get_from_keys(config, ["group_size"]),
+             sym=cls.get_from_keys(config, ["sym"]),
+@@ -179,6 +186,10 @@ class AutoRoundConfig(QuantizationConfig):
+             static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
+             gptq_defaulted_config_keys=gptq_defaulted_config_keys,
+         )
++        quant_config.packed_modules_mapping = (
++            config.get("packed_modules_mapping") or {}
++        )
++        return quant_config
+ 
+     def get_scaled_act_names(self) -> list[str]:
+         """Returns the activation function names that should be post-scaled.
+@@ -450,6 +461,14 @@ class AutoRoundConfig(QuantizationConfig):
+         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+ 
+         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
++        if "linear_attn" in prefix:
++            logger.debug(
++                "PATCH3(qwen38-int8): autoround-gptq %s -> bits=%s gs=%s sym=%s",
++                prefix,
++                weight_bits,
++                group_size,
++                sym,
++            )
+         if not self.check_quantized(weight_bits):
+             if isinstance(layer, (LinearBase, ParallelLMHead)):
+                 return UnquantizedLinearMethod()
